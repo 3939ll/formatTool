@@ -9,7 +9,13 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from processor import ProcessError, process_file, validate_mapping
+from processor import (
+    ProcessError,
+    get_output_dir,
+    merge_files,
+    process_file,
+    validate_mapping,
+)
 
 
 ctk.set_appearance_mode("dark")
@@ -31,6 +37,102 @@ COLORS = {
 }
 
 
+class SlidingSegment(ctk.CTkFrame):
+    """一体轨道 + 滑动主按钮；选中块与「选择文件」同款（青色底+深色字）。"""
+
+    def __init__(self, master, values: list[str], command=None, **kwargs):
+        self._pad = 3
+        self._seg_w = 120
+        self._btn_h = 40
+        self._track_h = self._btn_h + self._pad * 2
+        super().__init__(
+            master,
+            fg_color=COLORS["panel_alt"],
+            corner_radius=12,
+            border_width=1,
+            border_color=COLORS["border"],
+            height=self._track_h,
+            **kwargs,
+        )
+        self.values = values
+        self.command = command
+        self._index = 0
+        self._animating = False
+        total_w = self._pad * 2 + self._seg_w * len(values)
+        self.configure(width=total_w)
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+
+        # 底层：未选中文字（可点击）
+        self._labels: list[ctk.CTkLabel] = []
+        for i, text in enumerate(values):
+            lab = ctk.CTkLabel(
+                self,
+                text=text,
+                width=self._seg_w,
+                height=self._btn_h,
+                fg_color="transparent",
+                font=ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold"),
+                text_color=COLORS["text"],
+                cursor="hand2",
+            )
+            lab.place(x=self._pad + i * self._seg_w, y=self._pad)
+            lab.bind("<Button-1>", lambda _e, idx=i: self._on_click(idx))
+            self._labels.append(lab)
+
+        # 上层滑块：直接用 CTkButton，样式与「选择文件」一致（避免 Frame 被盖住看不见）
+        self._pill = ctk.CTkButton(
+            self,
+            text=values[0],
+            width=self._seg_w,
+            height=self._btn_h,
+            corner_radius=10,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#042f2e",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold"),
+            command=lambda: None,
+        )
+        self._pill.place(x=self._pad, y=self._pad)
+        self._sync_ghosts()
+
+    def get(self) -> str:
+        return self.values[self._index]
+
+    def set(self, value: str, animate: bool = True) -> None:
+        if value not in self.values:
+            return
+        idx = self.values.index(value)
+        if idx == self._index and not self._animating:
+            self._pill.configure(text=value)
+            self._sync_ghosts()
+            return
+        self._move_to(idx, animate=animate)
+
+    def _on_click(self, idx: int) -> None:
+        if idx == self._index or self._animating:
+            return
+        self._move_to(idx, animate=True)
+        if self.command:
+            self.command(self.values[idx])
+
+    def _pill_x(self, idx: int) -> int:
+        return self._pad + idx * self._seg_w
+
+    def _sync_ghosts(self) -> None:
+        for i, lab in enumerate(self._labels):
+            # 选中位由青色按钮盖住，底层字藏掉避免重影
+            lab.configure(text_color=COLORS["panel_alt"] if i == self._index else COLORS["text"])
+
+    def _move_to(self, idx: int, animate: bool = False) -> None:
+        # 直接切换选中，不做滑动动画
+        self._index = idx
+        self._animating = False
+        self._pill.configure(text=self.values[idx])
+        self._pill.place(x=self._pill_x(idx), y=self._pad)
+        self._sync_ghosts()
+
+
 class FormatToolApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -40,32 +142,85 @@ class FormatToolApp(ctk.CTk):
         self.configure(fg_color=COLORS["bg"])
 
         self.source_path: Path | None = None
+        self.merge_first_path: Path | None = None
+        self.merge_second_path: Path | None = None
         self.mapping_entries: list[ctk.CTkEntry] = []
         self.index_labels: list[ctk.CTkLabel] = []
         self._busy = False
+        self._current_tab = "map"
+        self._process_btn_width = 180
+        self._tab_labels = {"map": "格式映射", "merge": "格式添加"}
 
         self._build_ui()
 
     def _build_ui(self) -> None:
         root = ctk.CTkFrame(self, fg_color=COLORS["bg"])
-        root.pack(fill="both", expand=True, padx=28, pady=24)
+        root.pack(fill="both", expand=True, padx=24, pady=18)
+
+        header = ctk.CTkFrame(root, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 12))
 
         title = ctk.CTkLabel(
-            root,
+            header,
             text="TXT 格式处理工具",
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=28, weight="bold"),
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold"),
             text_color=COLORS["text"],
         )
-        title.pack(anchor="w")
+        title.pack(side="left")
 
-        subtitle = ctk.CTkLabel(
+        self.tab_seg = SlidingSegment(
+            header,
+            values=["格式映射", "格式添加"],
+            command=self._on_tab_seg,
+        )
+        self.tab_seg.pack(side="right")
+        self.tab_seg.set("格式映射", animate=False)
+
+        self.subtitle = ctk.CTkLabel(
             root,
-            text="按自定义映射重组 ---- 分隔字段，一键导出处理后的文本",
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text="按自定义映射重组 ---- 分隔字段",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
             text_color=COLORS["muted"],
         )
-        subtitle.pack(anchor="w", pady=(6, 22))
+        self.subtitle.pack(anchor="w", pady=(0, 12))
 
+        self.page_host = ctk.CTkFrame(root, fg_color="transparent")
+        self.page_host.pack(fill="both", expand=True)
+
+        self.map_page = ctk.CTkFrame(self.page_host, fg_color="transparent")
+        self.merge_page = ctk.CTkFrame(self.page_host, fg_color="transparent")
+
+        self._build_map_page(self.map_page)
+        self._build_merge_page(self.merge_page)
+        self.switch_tab("map", animate_tab=False)
+
+    def _on_tab_seg(self, value: str) -> None:
+        name = "map" if value == "格式映射" else "merge"
+        if self._busy and name != self._current_tab:
+            messagebox.showinfo("请稍候", "当前正在处理，请等待完成后再切换。")
+            self.tab_seg.set(self._tab_labels[self._current_tab], animate=False)
+            return
+        self.switch_tab(name, from_segment=True)
+
+    def switch_tab(self, name: str, from_segment: bool = False, animate_tab: bool = True) -> None:
+        if self._busy and name != self._current_tab:
+            messagebox.showinfo("请稍候", "当前正在处理，请等待完成后再切换。")
+            self.tab_seg.set(self._tab_labels[self._current_tab], animate=False)
+            return
+        self._current_tab = name
+        if not from_segment:
+            self.tab_seg.set(self._tab_labels[name], animate=animate_tab)
+        self.map_page.pack_forget()
+        self.merge_page.pack_forget()
+        if name == "map":
+            self.subtitle.configure(text="按自定义映射重组 ---- 分隔字段")
+            self.map_page.pack(fill="both", expand=True)
+        else:
+            self.subtitle.configure(text="两个 txt 按行拼接，先上传的在前")
+            self.merge_page.pack(fill="both", expand=True)
+
+    # ---------- 格式映射页 ----------
+    def _build_map_page(self, root: ctk.CTkFrame) -> None:
         file_card = ctk.CTkFrame(
             root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
         )
@@ -163,7 +318,6 @@ class FormatToolApp(ctk.CTk):
             command=self.generate_mapping_boxes,
         ).pack(side="left")
 
-        # 第 3 区先按内容固高排版，避免被底部栏 side=bottom 挤占后纵向压扁
         map_card = ctk.CTkFrame(
             root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
         )
@@ -191,10 +345,6 @@ class FormatToolApp(ctk.CTk):
         )
         self.map_hint.pack(anchor="w", pady=(4, 10))
 
-        # 横向滚动：tk.Frame 固高 + Canvas，高度锁定为两行内容。
-        # 根因不是「height 数值偏小」，而是 CTkScrollableFrame(horizontal)
-        # 在父级被挤压时会缩小 canvas，并把内部窗口高度锁成缩小后的值，
-        # 第二行被裁掉且没有纵向滚动可找回。
         self._map_row_h = 48
         self._map_row_gap = 8
         self._map_rows_h = self._map_row_h * 2 + self._map_row_gap
@@ -246,28 +396,26 @@ class FormatToolApp(ctk.CTk):
         self.mapping_row.pack(anchor="w")
         self.mapping_row.pack_propagate(False)
 
-        # 弹性空白吃掉多余高度，把底部栏顶在窗口下方，同时不挤压第 3 区
         ctk.CTkFrame(root, fg_color="transparent", height=1).pack(fill="both", expand=True)
 
         footer = ctk.CTkFrame(root, fg_color="transparent")
-        footer.pack(fill="x", pady=(12, 0))
+        footer.pack(fill="x", pady=(16, 0))
 
-        action = ctk.CTkFrame(footer, fg_color="transparent", height=48)
-        action.pack(fill="x", pady=(0, 14))
+        # 按钮单独窗口居中，状态文字再贴在按钮右侧（不参与居中）
+        action = ctk.CTkFrame(footer, fg_color="transparent", height=52)
+        action.pack(fill="x", pady=(0, 12))
         action.pack_propagate(False)
 
-        # 按钮单独左右居中，状态文字再贴在按钮右侧（不参与居中）
-        self._process_btn_width = 180
         self.process_btn = ctk.CTkButton(
             action,
             text="开始处理",
             width=self._process_btn_width,
-            height=48,
+            height=44,
             corner_radius=12,
             fg_color=COLORS["accent"],
             hover_color=COLORS["accent_hover"],
             text_color="#042f2e",
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=16, weight="bold"),
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
             command=self.start_process,
         )
         self.process_btn.place(relx=0.5, rely=0.5, anchor="center")
@@ -297,8 +445,141 @@ class FormatToolApp(ctk.CTk):
 
         self.generate_mapping_boxes()
 
+    # ---------- 格式添加页 ----------
+    def _build_merge_page(self, root: ctk.CTkFrame) -> None:
+        tip = ctk.CTkLabel(
+            root,
+            text="先后选择两个 txt，跳过空行后按行用 ---- 整行拼接；行少的一侧用完即停。",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+            text_color=COLORS["muted"],
+            anchor="w",
+        )
+        tip.pack(anchor="w", pady=(0, 14))
+
+        first_card = self._make_file_pick_card(
+            root,
+            title="1. 先上传的文件（拼在前面）",
+            label_attr="merge_first_label",
+            command=self.choose_merge_first,
+        )
+        first_card.pack(fill="x", pady=(0, 16))
+
+        second_card = self._make_file_pick_card(
+            root,
+            title="2. 后上传的文件（拼在后面）",
+            label_attr="merge_second_label",
+            command=self.choose_merge_second,
+        )
+        second_card.pack(fill="x", pady=(0, 16))
+
+        out_card = ctk.CTkFrame(
+            root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
+        )
+        out_card.pack(fill="x")
+        out_inner = ctk.CTkFrame(out_card, fg_color="transparent")
+        out_inner.pack(fill="x", padx=18, pady=16)
+        ctk.CTkLabel(
+            out_inner,
+            text="3. 输出位置",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=COLORS["text"],
+        ).pack(anchor="w")
+        self.merge_out_label = ctk.CTkLabel(
+            out_inner,
+            text=str(get_output_dir()),
+            anchor="w",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        )
+        self.merge_out_label.pack(anchor="w", pady=(10, 0))
+
+        ctk.CTkFrame(root, fg_color="transparent", height=1).pack(fill="both", expand=True)
+
+        footer = ctk.CTkFrame(root, fg_color="transparent")
+        footer.pack(fill="x", pady=(16, 0))
+
+        action = ctk.CTkFrame(footer, fg_color="transparent", height=52)
+        action.pack(fill="x", pady=(0, 12))
+        action.pack_propagate(False)
+
+        self.merge_btn = ctk.CTkButton(
+            action,
+            text="开始拼接",
+            width=self._process_btn_width,
+            height=44,
+            corner_radius=12,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#042f2e",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            command=self.start_merge,
+        )
+        self.merge_btn.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.merge_status_label = ctk.CTkLabel(
+            action,
+            text="就绪",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        )
+        self.merge_status_label.place(
+            relx=0.5,
+            rely=0.5,
+            anchor="w",
+            x=self._process_btn_width // 2 + 16,
+        )
+
+        self.merge_progress = ctk.CTkProgressBar(
+            footer,
+            height=8,
+            corner_radius=8,
+            fg_color=COLORS["panel_alt"],
+            progress_color=COLORS["accent"],
+        )
+        self.merge_progress.pack(fill="x")
+        self.merge_progress.set(0)
+
+    def _make_file_pick_card(self, parent, title: str, label_attr: str, command):
+        card = ctk.CTkFrame(
+            parent, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
+        )
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=18, pady=16)
+        ctk.CTkLabel(
+            inner,
+            text=title,
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=COLORS["text"],
+        ).pack(anchor="w")
+        row = ctk.CTkFrame(inner, fg_color="transparent")
+        row.pack(fill="x", pady=(12, 0))
+        label = ctk.CTkLabel(
+            row,
+            text="尚未选择文件",
+            anchor="w",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+            fg_color=COLORS["input"],
+            corner_radius=10,
+            height=40,
+        )
+        label.pack(side="left", fill="x", expand=True, padx=(0, 12))
+        setattr(self, label_attr, label)
+        ctk.CTkButton(
+            row,
+            text="选择文件",
+            width=120,
+            height=40,
+            corner_radius=10,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#042f2e",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold"),
+            command=command,
+        ).pack(side="right")
+        return card
+
     def _sync_map_scroll(self) -> None:
-        """锁定两行完整可见高度，只维护横向 scrollregion。"""
         self.map_content.update_idletasks()
         req_h = max(self.map_content.winfo_reqheight(), 1)
         req_w = max(self.map_content.winfo_reqwidth(), 1)
@@ -319,6 +600,28 @@ class FormatToolApp(ctk.CTk):
         self.source_path = Path(path)
         self.file_label.configure(text=str(self.source_path), text_color=COLORS["text"])
         self.set_status("已选择文件，设置映射后即可处理", COLORS["muted"])
+
+    def choose_merge_first(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择先上传的 TXT",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        self.merge_first_path = Path(path)
+        self.merge_first_label.configure(text=str(self.merge_first_path), text_color=COLORS["text"])
+        self.set_merge_status("已选择先上传文件", COLORS["muted"])
+
+    def choose_merge_second(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择后上传的 TXT",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        self.merge_second_path = Path(path)
+        self.merge_second_label.configure(text=str(self.merge_second_path), text_color=COLORS["text"])
+        self.set_merge_status("已选择后上传文件", COLORS["muted"])
 
     def generate_mapping_boxes(self) -> None:
         raw = self.segment_entry.get().strip()
@@ -422,7 +725,6 @@ class FormatToolApp(ctk.CTk):
             if self.source_path is None:
                 raise ProcessError("请先选择 txt 文件。")
             segment_count, mapping = self.read_mapping()
-            # 开始前就校验（含全 0），避免进入处理状态后才报错/卡住
             validate_mapping(segment_count, mapping)
         except ProcessError as exc:
             messagebox.showerror("无法开始", str(exc))
@@ -459,10 +761,55 @@ class FormatToolApp(ctk.CTk):
             result = process_file(source, segment_count, mapping, on_progress)
             self.after(0, lambda r=result: self._on_success(r))
         except ProcessError as exc:
-            # 必须用默认参数绑定消息，否则 except 结束后 exc 会被清除，回调卡住
             self.after(0, lambda msg=str(exc): self._on_error(msg))
         except Exception as exc:  # noqa: BLE001
             self.after(0, lambda msg=f"处理失败：{exc}": self._on_error(msg))
+
+    def start_merge(self) -> None:
+        if self._busy:
+            return
+        try:
+            if self.merge_first_path is None:
+                raise ProcessError("请先选择先上传的 txt 文件。")
+            if self.merge_second_path is None:
+                raise ProcessError("请选择后上传的 txt 文件。")
+        except ProcessError as exc:
+            messagebox.showerror("无法开始", str(exc))
+            self.set_merge_status(str(exc), COLORS["danger"])
+            return
+
+        self._busy = True
+        self.merge_btn.configure(state="disabled")
+        self.merge_progress.set(0)
+        self.set_merge_status("正在拼接，请稍候…", COLORS["accent"])
+        self.merge_out_label.configure(text=str(get_output_dir()))
+
+        thread = threading.Thread(
+            target=self._run_merge,
+            args=(self.merge_first_path, self.merge_second_path),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_merge(self, first: Path, second: Path) -> None:
+        try:
+            def on_progress(done: int) -> None:
+                # 不知道最终总数时给一个缓慢推进感
+                ratio = min(0.95, 0.1 + (done % 2000) / 2200)
+                self.after(
+                    0,
+                    lambda d=done, r=ratio: (
+                        self.set_merge_status(f"已拼接 {d} 行…", COLORS["accent"]),
+                        self.merge_progress.set(r),
+                    ),
+                )
+
+            result = merge_files(first, second, get_output_dir(), on_progress)
+            self.after(0, lambda r=result: self._on_merge_success(r))
+        except ProcessError as exc:
+            self.after(0, lambda msg=str(exc): self._on_merge_error(msg))
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda msg=f"拼接失败：{exc}": self._on_merge_error(msg))
 
     def _on_success(self, result) -> None:
         self._busy = False
@@ -488,8 +835,43 @@ class FormatToolApp(ctk.CTk):
         self.set_status(message, COLORS["danger"])
         messagebox.showerror("处理失败", message)
 
+    def _on_merge_success(self, result) -> None:
+        self._busy = False
+        self.merge_btn.configure(state="normal")
+        self.merge_progress.set(1)
+
+        if result.remainder_count > 0 and result.remainder_path is not None:
+            side = "先上传文件" if result.remainder_side == "first" else "后上传文件"
+            rem_text = (
+                f"剩余：{result.remainder_count} 行（{side}）\n"
+                f"剩余文件：\n{result.remainder_path}"
+            )
+            status = f"完成｜拼接 {result.merged_count}｜剩余 {result.remainder_count}"
+        else:
+            rem_text = "剩余：无剩余"
+            status = f"完成｜拼接 {result.merged_count}｜无剩余"
+
+        msg = (
+            f"拼接完成\n\n"
+            f"成功拼接：{result.merged_count} 行\n"
+            f"{rem_text}\n\n"
+            f"合并文件：\n{result.merged_path}"
+        )
+        self.set_merge_status(status, COLORS["ok"])
+        messagebox.showinfo("拼接完成", msg)
+
+    def _on_merge_error(self, message: str) -> None:
+        self._busy = False
+        self.merge_btn.configure(state="normal")
+        self.merge_progress.set(0)
+        self.set_merge_status(message, COLORS["danger"])
+        messagebox.showerror("拼接失败", message)
+
     def set_status(self, text: str, color: str) -> None:
         self.status_label.configure(text=text, text_color=color)
+
+    def set_merge_status(self, text: str, color: str) -> None:
+        self.merge_status_label.configure(text=text, text_color=color)
 
 
 def main() -> None:

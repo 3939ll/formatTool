@@ -5,5 +5,7 @@ build/
 dist/
 *.spec
 _tmp_test/
+_merge_test/
 _bench.txt
 .idea/
+proxies_*.txt
