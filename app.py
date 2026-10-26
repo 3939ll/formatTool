@@ -11,8 +11,11 @@ import customtkinter as ctk
 
 from processor import (
     ProcessError,
+    dedupe_files,
+    extract_lines,
     get_output_dir,
     merge_files,
+    process_alias_file,
     process_file,
     validate_mapping,
 )
@@ -42,7 +45,7 @@ class SlidingSegment(ctk.CTkFrame):
 
     def __init__(self, master, values: list[str], command=None, **kwargs):
         self._pad = 3
-        self._seg_w = 120
+        self._seg_w = 88
         self._btn_h = 40
         self._track_h = self._btn_h + self._pad * 2
         super().__init__(
@@ -137,19 +140,37 @@ class FormatToolApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TXT 格式处理工具")
-        self.geometry("920x700")
-        self.minsize(820, 640)
+        self.geometry("980x700")
+        self.minsize(900, 640)
         self.configure(fg_color=COLORS["bg"])
 
         self.source_path: Path | None = None
         self.merge_first_path: Path | None = None
         self.merge_second_path: Path | None = None
+        self.alias_path: Path | None = None
+        self.extract_path: Path | None = None
+        self.dedupe_first_path: Path | None = None
+        self.dedupe_second_path: Path | None = None
         self.mapping_entries: list[ctk.CTkEntry] = []
         self.index_labels: list[ctk.CTkLabel] = []
         self._busy = False
         self._current_tab = "map"
         self._process_btn_width = 180
-        self._tab_labels = {"map": "格式映射", "merge": "格式添加"}
+        self._tab_labels = {
+            "map": "格式映射",
+            "merge": "格式添加",
+            "alias": "别名随机",
+            "extract": "提取数据",
+            "dedupe": "文件去重",
+        }
+        self._tab_by_label = {v: k for k, v in self._tab_labels.items()}
+        self._tab_subtitles = {
+            "map": "按自定义映射重组 ---- 分隔字段",
+            "merge": "两个 txt 按行拼接，先上传的在前",
+            "alias": "第 1 段邮箱 @ 前随机加 +小写字母，其余段原样",
+            "extract": "从开头提取 N 条有效行，逐行写入输出并从原文件删除",
+            "dedupe": "两文件整行对比：相同行一份，两边独有整合一份",
+        }
 
         self._build_ui()
 
@@ -163,14 +184,14 @@ class FormatToolApp(ctk.CTk):
         title = ctk.CTkLabel(
             header,
             text="TXT 格式处理工具",
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold"),
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=20, weight="bold"),
             text_color=COLORS["text"],
         )
         title.pack(side="left")
 
         self.tab_seg = SlidingSegment(
             header,
-            values=["格式映射", "格式添加"],
+            values=["格式映射", "格式添加", "别名随机", "提取数据", "文件去重"],
             command=self._on_tab_seg,
         )
         self.tab_seg.pack(side="right")
@@ -178,7 +199,7 @@ class FormatToolApp(ctk.CTk):
 
         self.subtitle = ctk.CTkLabel(
             root,
-            text="按自定义映射重组 ---- 分隔字段",
+            text=self._tab_subtitles["map"],
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
             text_color=COLORS["muted"],
         )
@@ -189,13 +210,19 @@ class FormatToolApp(ctk.CTk):
 
         self.map_page = ctk.CTkFrame(self.page_host, fg_color="transparent")
         self.merge_page = ctk.CTkFrame(self.page_host, fg_color="transparent")
+        self.alias_page = ctk.CTkFrame(self.page_host, fg_color="transparent")
+        self.extract_page = ctk.CTkFrame(self.page_host, fg_color="transparent")
+        self.dedupe_page = ctk.CTkFrame(self.page_host, fg_color="transparent")
 
         self._build_map_page(self.map_page)
         self._build_merge_page(self.merge_page)
+        self._build_alias_page(self.alias_page)
+        self._build_extract_page(self.extract_page)
+        self._build_dedupe_page(self.dedupe_page)
         self.switch_tab("map", animate_tab=False)
 
     def _on_tab_seg(self, value: str) -> None:
-        name = "map" if value == "格式映射" else "merge"
+        name = self._tab_by_label.get(value, "map")
         if self._busy and name != self._current_tab:
             messagebox.showinfo("请稍候", "当前正在处理，请等待完成后再切换。")
             self.tab_seg.set(self._tab_labels[self._current_tab], animate=False)
@@ -212,12 +239,18 @@ class FormatToolApp(ctk.CTk):
             self.tab_seg.set(self._tab_labels[name], animate=animate_tab)
         self.map_page.pack_forget()
         self.merge_page.pack_forget()
-        if name == "map":
-            self.subtitle.configure(text="按自定义映射重组 ---- 分隔字段")
-            self.map_page.pack(fill="both", expand=True)
-        else:
-            self.subtitle.configure(text="两个 txt 按行拼接，先上传的在前")
-            self.merge_page.pack(fill="both", expand=True)
+        self.alias_page.pack_forget()
+        self.extract_page.pack_forget()
+        self.dedupe_page.pack_forget()
+        self.subtitle.configure(text=self._tab_subtitles[name])
+        page = {
+            "map": self.map_page,
+            "merge": self.merge_page,
+            "alias": self.alias_page,
+            "extract": self.extract_page,
+            "dedupe": self.dedupe_page,
+        }[name]
+        page.pack(fill="both", expand=True)
 
     # ---------- 格式映射页 ----------
     def _build_map_page(self, root: ctk.CTkFrame) -> None:
@@ -539,6 +572,305 @@ class FormatToolApp(ctk.CTk):
         self.merge_progress.pack(fill="x")
         self.merge_progress.set(0)
 
+    # ---------- 别名随机页 ----------
+    def _build_alias_page(self, root: ctk.CTkFrame) -> None:
+        tip = ctk.CTkLabel(
+            root,
+            text="对每行第 1 段邮箱在 @ 前加 + 与 4~6 位随机小写字母；无 @ / 空行跳过。",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+            text_color=COLORS["muted"],
+            anchor="w",
+        )
+        tip.pack(anchor="w", pady=(0, 14))
+
+        file_card = self._make_file_pick_card(
+            root,
+            title="1. 选择 TXT 文件",
+            label_attr="alias_file_label",
+            command=self.choose_alias_file,
+        )
+        file_card.pack(fill="x", pady=(0, 16))
+
+        out_card = ctk.CTkFrame(
+            root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
+        )
+        out_card.pack(fill="x")
+        out_inner = ctk.CTkFrame(out_card, fg_color="transparent")
+        out_inner.pack(fill="x", padx=18, pady=16)
+        ctk.CTkLabel(
+            out_inner,
+            text="2. 输出位置",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=COLORS["text"],
+        ).pack(anchor="w")
+        self.alias_out_label = ctk.CTkLabel(
+            out_inner,
+            text=str(get_output_dir()),
+            anchor="w",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        )
+        self.alias_out_label.pack(anchor="w", pady=(10, 0))
+
+        ctk.CTkFrame(root, fg_color="transparent", height=1).pack(fill="both", expand=True)
+
+        footer = ctk.CTkFrame(root, fg_color="transparent")
+        footer.pack(fill="x", pady=(16, 0))
+
+        action = ctk.CTkFrame(footer, fg_color="transparent", height=52)
+        action.pack(fill="x", pady=(0, 12))
+        action.pack_propagate(False)
+
+        self.alias_btn = ctk.CTkButton(
+            action,
+            text="开始处理",
+            width=self._process_btn_width,
+            height=44,
+            corner_radius=12,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#042f2e",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            command=self.start_alias,
+        )
+        self.alias_btn.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.alias_status_label = ctk.CTkLabel(
+            action,
+            text="就绪",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        )
+        self.alias_status_label.place(
+            relx=0.5,
+            rely=0.5,
+            anchor="w",
+            x=self._process_btn_width // 2 + 16,
+        )
+
+        self.alias_progress = ctk.CTkProgressBar(
+            footer,
+            height=8,
+            corner_radius=8,
+            fg_color=COLORS["panel_alt"],
+            progress_color=COLORS["accent"],
+        )
+        self.alias_progress.pack(fill="x")
+        self.alias_progress.set(0)
+
+    # ---------- 提取数据页 ----------
+    def _build_extract_page(self, root: ctk.CTkFrame) -> None:
+        tip = ctk.CTkLabel(
+            root,
+            text="从开头取 N 条非空行；每提一行立刻写入输出并从原文件删除。空行只删不写。",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+            text_color=COLORS["muted"],
+            anchor="w",
+        )
+        tip.pack(anchor="w", pady=(0, 14))
+
+        file_card = self._make_file_pick_card(
+            root,
+            title="1. 选择 TXT 文件（会改写该文件）",
+            label_attr="extract_file_label",
+            command=self.choose_extract_file,
+        )
+        file_card.pack(fill="x", pady=(0, 16))
+
+        count_card = ctk.CTkFrame(
+            root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
+        )
+        count_card.pack(fill="x", pady=(0, 16))
+        count_inner = ctk.CTkFrame(count_card, fg_color="transparent")
+        count_inner.pack(fill="x", padx=18, pady=16)
+        ctk.CTkLabel(
+            count_inner,
+            text="2. 提取个数",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=COLORS["text"],
+        ).pack(anchor="w")
+        count_row = ctk.CTkFrame(count_inner, fg_color="transparent")
+        count_row.pack(fill="x", pady=(12, 0))
+        ctk.CTkLabel(
+            count_row,
+            text="有效行数",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        ).pack(side="left")
+        self.extract_count_entry = ctk.CTkEntry(
+            count_row,
+            width=120,
+            height=38,
+            corner_radius=10,
+            fg_color=COLORS["input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(size=14),
+            justify="center",
+        )
+        self.extract_count_entry.pack(side="left", padx=(12, 0))
+        self.extract_count_entry.insert(0, "10")
+
+        out_card = ctk.CTkFrame(
+            root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
+        )
+        out_card.pack(fill="x")
+        out_inner = ctk.CTkFrame(out_card, fg_color="transparent")
+        out_inner.pack(fill="x", padx=18, pady=16)
+        ctk.CTkLabel(
+            out_inner,
+            text="3. 输出位置",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=COLORS["text"],
+        ).pack(anchor="w")
+        self.extract_out_label = ctk.CTkLabel(
+            out_inner,
+            text=str(get_output_dir()),
+            anchor="w",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        )
+        self.extract_out_label.pack(anchor="w", pady=(10, 0))
+
+        ctk.CTkFrame(root, fg_color="transparent", height=1).pack(fill="both", expand=True)
+
+        footer = ctk.CTkFrame(root, fg_color="transparent")
+        footer.pack(fill="x", pady=(16, 0))
+        action = ctk.CTkFrame(footer, fg_color="transparent", height=52)
+        action.pack(fill="x", pady=(0, 12))
+        action.pack_propagate(False)
+
+        self.extract_btn = ctk.CTkButton(
+            action,
+            text="开始提取",
+            width=self._process_btn_width,
+            height=44,
+            corner_radius=12,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#042f2e",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            command=self.start_extract,
+        )
+        self.extract_btn.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.extract_status_label = ctk.CTkLabel(
+            action,
+            text="就绪",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        )
+        self.extract_status_label.place(
+            relx=0.5,
+            rely=0.5,
+            anchor="w",
+            x=self._process_btn_width // 2 + 16,
+        )
+
+        self.extract_progress = ctk.CTkProgressBar(
+            footer,
+            height=8,
+            corner_radius=8,
+            fg_color=COLORS["panel_alt"],
+            progress_color=COLORS["accent"],
+        )
+        self.extract_progress.pack(fill="x")
+        self.extract_progress.set(0)
+
+    # ---------- 文件去重页 ----------
+    def _build_dedupe_page(self, root: ctk.CTkFrame) -> None:
+        tip = ctk.CTkLabel(
+            root,
+            text="两文件按整行内容集合对比（忽略空行）；写出相同行与两边独有整合，行内只留一份。",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+            text_color=COLORS["muted"],
+            anchor="w",
+        )
+        tip.pack(anchor="w", pady=(0, 14))
+
+        first_card = self._make_file_pick_card(
+            root,
+            title="1. 选择文件 1",
+            label_attr="dedupe_first_label",
+            command=self.choose_dedupe_first,
+        )
+        first_card.pack(fill="x", pady=(0, 16))
+
+        second_card = self._make_file_pick_card(
+            root,
+            title="2. 选择文件 2",
+            label_attr="dedupe_second_label",
+            command=self.choose_dedupe_second,
+        )
+        second_card.pack(fill="x", pady=(0, 16))
+
+        out_card = ctk.CTkFrame(
+            root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
+        )
+        out_card.pack(fill="x")
+        out_inner = ctk.CTkFrame(out_card, fg_color="transparent")
+        out_inner.pack(fill="x", padx=18, pady=16)
+        ctk.CTkLabel(
+            out_inner,
+            text="3. 输出位置",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=COLORS["text"],
+        ).pack(anchor="w")
+        self.dedupe_out_label = ctk.CTkLabel(
+            out_inner,
+            text=str(get_output_dir()),
+            anchor="w",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        )
+        self.dedupe_out_label.pack(anchor="w", pady=(10, 0))
+
+        ctk.CTkFrame(root, fg_color="transparent", height=1).pack(fill="both", expand=True)
+
+        footer = ctk.CTkFrame(root, fg_color="transparent")
+        footer.pack(fill="x", pady=(16, 0))
+
+        action = ctk.CTkFrame(footer, fg_color="transparent", height=52)
+        action.pack(fill="x", pady=(0, 12))
+        action.pack_propagate(False)
+
+        self.dedupe_btn = ctk.CTkButton(
+            action,
+            text="开始去重",
+            width=self._process_btn_width,
+            height=44,
+            corner_radius=12,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#042f2e",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            command=self.start_dedupe,
+        )
+        self.dedupe_btn.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.dedupe_status_label = ctk.CTkLabel(
+            action,
+            text="就绪",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            text_color=COLORS["muted"],
+        )
+        self.dedupe_status_label.place(
+            relx=0.5,
+            rely=0.5,
+            anchor="w",
+            x=self._process_btn_width // 2 + 16,
+        )
+
+        self.dedupe_progress = ctk.CTkProgressBar(
+            footer,
+            height=8,
+            corner_radius=8,
+            fg_color=COLORS["panel_alt"],
+            progress_color=COLORS["accent"],
+        )
+        self.dedupe_progress.pack(fill="x")
+        self.dedupe_progress.set(0)
+
     def _make_file_pick_card(self, parent, title: str, label_attr: str, command):
         card = ctk.CTkFrame(
             parent, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
@@ -622,6 +954,50 @@ class FormatToolApp(ctk.CTk):
         self.merge_second_path = Path(path)
         self.merge_second_label.configure(text=str(self.merge_second_path), text_color=COLORS["text"])
         self.set_merge_status("已选择后上传文件", COLORS["muted"])
+
+    def choose_alias_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择 TXT 文件",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        self.alias_path = Path(path)
+        self.alias_file_label.configure(text=str(self.alias_path), text_color=COLORS["text"])
+        self.set_alias_status("已选择文件", COLORS["muted"])
+
+    def choose_extract_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择要提取的 TXT（会改写原文件）",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        self.extract_path = Path(path)
+        self.extract_file_label.configure(text=str(self.extract_path), text_color=COLORS["text"])
+        self.set_extract_status("已选择文件（提取后原文件会被改写）", COLORS["muted"])
+
+    def choose_dedupe_first(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择文件 1",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        self.dedupe_first_path = Path(path)
+        self.dedupe_first_label.configure(text=str(self.dedupe_first_path), text_color=COLORS["text"])
+        self.set_dedupe_status("已选择文件 1", COLORS["muted"])
+
+    def choose_dedupe_second(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择文件 2",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        self.dedupe_second_path = Path(path)
+        self.dedupe_second_label.configure(text=str(self.dedupe_second_path), text_color=COLORS["text"])
+        self.set_dedupe_status("已选择文件 2", COLORS["muted"])
 
     def generate_mapping_boxes(self) -> None:
         raw = self.segment_entry.get().strip()
@@ -811,6 +1187,52 @@ class FormatToolApp(ctk.CTk):
         except Exception as exc:  # noqa: BLE001
             self.after(0, lambda msg=f"拼接失败：{exc}": self._on_merge_error(msg))
 
+    def start_alias(self) -> None:
+        if self._busy:
+            return
+        try:
+            if self.alias_path is None:
+                raise ProcessError("请先选择 txt 文件。")
+        except ProcessError as exc:
+            messagebox.showerror("无法开始", str(exc))
+            self.set_alias_status(str(exc), COLORS["danger"])
+            return
+
+        self._busy = True
+        self.alias_btn.configure(state="disabled")
+        self.alias_progress.set(0)
+        self.set_alias_status("正在处理，请稍候…", COLORS["accent"])
+        self.alias_out_label.configure(text=str(get_output_dir()))
+
+        thread = threading.Thread(
+            target=self._run_alias,
+            args=(self.alias_path,),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_alias(self, source: Path) -> None:
+        try:
+            def on_progress(done: int, total: int, success: int, skipped: int) -> None:
+                ratio = (done / total) if total else 1.0
+                self.after(
+                    0,
+                    lambda d=done, t=total, s=success, k=skipped, r=ratio: (
+                        self.set_alias_status(
+                            f"已处理 {d}/{t} 行｜成功 {s}｜跳过 {k}",
+                            COLORS["accent"],
+                        ),
+                        self.alias_progress.set(r),
+                    ),
+                )
+
+            result = process_alias_file(source, get_output_dir(), on_progress)
+            self.after(0, lambda r=result: self._on_alias_success(r))
+        except ProcessError as exc:
+            self.after(0, lambda msg=str(exc): self._on_alias_error(msg))
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda msg=f"处理失败：{exc}": self._on_alias_error(msg))
+
     def _on_success(self, result) -> None:
         self._busy = False
         self.process_btn.configure(state="normal")
@@ -867,11 +1289,197 @@ class FormatToolApp(ctk.CTk):
         self.set_merge_status(message, COLORS["danger"])
         messagebox.showerror("拼接失败", message)
 
+    def _on_alias_success(self, result) -> None:
+        self._busy = False
+        self.alias_btn.configure(state="normal")
+        self.alias_progress.set(1)
+        msg = (
+            f"处理完成\n\n"
+            f"总行数：{result.total_lines}\n"
+            f"成功：{result.success_lines}\n"
+            f"跳过：{result.skipped_lines}\n\n"
+            f"输出文件：\n{result.output_path}"
+        )
+        self.set_alias_status(
+            f"完成｜成功 {result.success_lines}｜跳过 {result.skipped_lines}",
+            COLORS["ok"],
+        )
+        messagebox.showinfo("处理完成", msg)
+
+    def _on_alias_error(self, message: str) -> None:
+        self._busy = False
+        self.alias_btn.configure(state="normal")
+        self.alias_progress.set(0)
+        self.set_alias_status(message, COLORS["danger"])
+        messagebox.showerror("处理失败", message)
+
+    def start_extract(self) -> None:
+        if self._busy:
+            return
+        try:
+            if self.extract_path is None:
+                raise ProcessError("请先选择 txt 文件。")
+            raw = self.extract_count_entry.get().strip()
+            if not raw.isdigit() or int(raw) < 1:
+                raise ProcessError("提取个数必须是大于等于 1 的整数。")
+            count = int(raw)
+        except ProcessError as exc:
+            messagebox.showerror("无法开始", str(exc))
+            self.set_extract_status(str(exc), COLORS["danger"])
+            return
+
+        self._busy = True
+        self.extract_btn.configure(state="disabled")
+        self.extract_progress.set(0)
+        self.set_extract_status("正在提取，请稍候…", COLORS["accent"])
+        self.extract_out_label.configure(text=str(get_output_dir()))
+
+        thread = threading.Thread(
+            target=self._run_extract,
+            args=(self.extract_path, count),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_extract(self, source: Path, count: int) -> None:
+        try:
+            def on_progress(done: int, total: int, removed_empty: int) -> None:
+                ratio = (done / total) if total else 1.0
+                self.after(
+                    0,
+                    lambda d=done, t=total, e=removed_empty, r=ratio: (
+                        self.set_extract_status(
+                            f"已提取 {d}/{t}｜清理空行 {e}",
+                            COLORS["accent"],
+                        ),
+                        self.extract_progress.set(min(1.0, r)),
+                    ),
+                )
+
+            result = extract_lines(source, count, get_output_dir(), on_progress)
+            self.after(0, lambda r=result: self._on_extract_success(r))
+        except ProcessError as exc:
+            self.after(0, lambda msg=str(exc): self._on_extract_error(msg))
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda msg=f"提取失败：{exc}": self._on_extract_error(msg))
+
+    def _on_extract_success(self, result) -> None:
+        self._busy = False
+        self.extract_btn.configure(state="normal")
+        self.extract_progress.set(1)
+        extra = "（原文件已提空）" if result.source_exhausted else ""
+        msg = (
+            f"提取完成{extra}\n\n"
+            f"目标：{result.requested} 行\n"
+            f"实际提取：{result.extracted} 行\n"
+            f"清理空行：{result.removed_empty}\n\n"
+            f"输出文件：\n{result.output_path}"
+        )
+        self.set_extract_status(
+            f"完成｜提取 {result.extracted}/{result.requested}",
+            COLORS["ok"],
+        )
+        messagebox.showinfo("提取完成", msg)
+
+    def _on_extract_error(self, message: str) -> None:
+        self._busy = False
+        self.extract_btn.configure(state="normal")
+        self.extract_progress.set(0)
+        self.set_extract_status(message, COLORS["danger"])
+        messagebox.showerror("提取失败", message)
+
+    def start_dedupe(self) -> None:
+        if self._busy:
+            return
+        try:
+            if self.dedupe_first_path is None:
+                raise ProcessError("请先选择文件 1。")
+            if self.dedupe_second_path is None:
+                raise ProcessError("请选择文件 2。")
+        except ProcessError as exc:
+            messagebox.showerror("无法开始", str(exc))
+            self.set_dedupe_status(str(exc), COLORS["danger"])
+            return
+
+        self._busy = True
+        self.dedupe_btn.configure(state="disabled")
+        self.dedupe_progress.set(0)
+        self.set_dedupe_status("正在去重，请稍候…", COLORS["accent"])
+        self.dedupe_out_label.configure(text=str(get_output_dir()))
+
+        thread = threading.Thread(
+            target=self._run_dedupe,
+            args=(self.dedupe_first_path, self.dedupe_second_path),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_dedupe(self, first: Path, second: Path) -> None:
+        try:
+            def on_progress(stage: str, a: int, b: int) -> None:
+                if stage == "read1":
+                    text, ratio = f"读取文件 1… {a} 行｜有效 {b}", 0.15
+                elif stage == "read2":
+                    text, ratio = f"读取文件 2… {a} 行｜有效 {b}", 0.45
+                elif stage == "compare":
+                    text, ratio = "正在对比集合…", 0.7
+                elif stage == "write":
+                    text, ratio = f"正在写入… 相同 {a}｜独有 {b}", 0.9
+                else:
+                    text, ratio = f"完成｜相同 {a}｜独有 {b}", 1.0
+                self.after(
+                    0,
+                    lambda t=text, r=ratio: (
+                        self.set_dedupe_status(t, COLORS["accent"]),
+                        self.dedupe_progress.set(r),
+                    ),
+                )
+
+            result = dedupe_files(first, second, get_output_dir(), on_progress)
+            self.after(0, lambda r=result: self._on_dedupe_success(r))
+        except ProcessError as exc:
+            self.after(0, lambda msg=str(exc): self._on_dedupe_error(msg))
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda msg=f"去重失败：{exc}": self._on_dedupe_error(msg))
+
+    def _on_dedupe_success(self, result) -> None:
+        self._busy = False
+        self.dedupe_btn.configure(state="normal")
+        self.dedupe_progress.set(1)
+        msg = (
+            f"去重完成\n\n"
+            f"相同行：{result.same_count}\n"
+            f"{result.same_path}\n\n"
+            f"独有行：{result.unique_count}\n"
+            f"{result.unique_path}"
+        )
+        self.set_dedupe_status(
+            f"完成｜相同 {result.same_count}｜独有 {result.unique_count}",
+            COLORS["ok"],
+        )
+        messagebox.showinfo("去重完成", msg)
+
+    def _on_dedupe_error(self, message: str) -> None:
+        self._busy = False
+        self.dedupe_btn.configure(state="normal")
+        self.dedupe_progress.set(0)
+        self.set_dedupe_status(message, COLORS["danger"])
+        messagebox.showerror("去重失败", message)
+
     def set_status(self, text: str, color: str) -> None:
         self.status_label.configure(text=text, text_color=color)
 
     def set_merge_status(self, text: str, color: str) -> None:
         self.merge_status_label.configure(text=text, text_color=color)
+
+    def set_alias_status(self, text: str, color: str) -> None:
+        self.alias_status_label.configure(text=text, text_color=color)
+
+    def set_extract_status(self, text: str, color: str) -> None:
+        self.extract_status_label.configure(text=text, text_color=color)
+
+    def set_dedupe_status(self, text: str, color: str) -> None:
+        self.dedupe_status_label.configure(text=text, text_color=color)
 
 
 def main() -> None:
