@@ -15,6 +15,7 @@ from processor import (
     extract_lines,
     get_output_dir,
     merge_files,
+    parse_alias_length,
     process_alias_file,
     process_file,
     validate_mapping,
@@ -140,8 +141,8 @@ class FormatToolApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TXT 格式处理工具")
-        self.geometry("980x700")
-        self.minsize(900, 640)
+        self.geometry("980x760")
+        self.minsize(900, 680)
         self.configure(fg_color=COLORS["bg"])
 
         self.source_path: Path | None = None
@@ -167,7 +168,7 @@ class FormatToolApp(ctk.CTk):
         self._tab_subtitles = {
             "map": "按自定义映射重组 ---- 分隔字段",
             "merge": "两个 txt 按行拼接，先上传的在前",
-            "alias": "第 1 段邮箱 @ 前随机加 +小写字母，其余段原样",
+            "alias": "第 1 段邮箱 @ 前加 +指定串+随机字母数字，其余段原样",
             "extract": "从开头提取 N 条有效行，逐行写入输出并从原文件删除",
             "dedupe": "两文件整行对比：相同行一份，两边独有整合一份",
         }
@@ -576,7 +577,7 @@ class FormatToolApp(ctk.CTk):
     def _build_alias_page(self, root: ctk.CTkFrame) -> None:
         tip = ctk.CTkLabel(
             root,
-            text="对每行第 1 段邮箱在 @ 前加 + 与 4~6 位随机小写字母；无 @ / 空行跳过。",
+            text="第 1 段邮箱在 @ 前加 +、可选指定串、再接随机（首位字母，其余字母+数字）；无 @ / 空行跳过。",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
             text_color=COLORS["muted"],
             anchor="w",
@@ -591,6 +592,78 @@ class FormatToolApp(ctk.CTk):
         )
         file_card.pack(fill="x", pady=(0, 16))
 
+        len_card = ctk.CTkFrame(
+            root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
+        )
+        len_card.pack(fill="x", pady=(0, 16))
+        len_inner = ctk.CTkFrame(len_card, fg_color="transparent")
+        len_inner.pack(fill="x", padx=18, pady=16)
+        ctk.CTkLabel(
+            len_inner,
+            text="2. 随机位数（空=4~6；只填一边=固定位数；左大于右则对调）",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=COLORS["text"],
+        ).pack(anchor="w")
+        len_row = ctk.CTkFrame(len_inner, fg_color="transparent")
+        len_row.pack(fill="x", pady=(12, 0))
+        self.alias_len_low = ctk.CTkEntry(
+            len_row,
+            width=80,
+            height=38,
+            corner_radius=10,
+            fg_color=COLORS["input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(size=14),
+            justify="center",
+        )
+        self.alias_len_low.pack(side="left")
+        self.alias_len_low.insert(0, "4")
+        ctk.CTkLabel(
+            len_row,
+            text="-",
+            width=24,
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=16, weight="bold"),
+            text_color=COLORS["muted"],
+        ).pack(side="left")
+        self.alias_len_high = ctk.CTkEntry(
+            len_row,
+            width=80,
+            height=38,
+            corner_radius=10,
+            fg_color=COLORS["input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(size=14),
+            justify="center",
+        )
+        self.alias_len_high.pack(side="left")
+        self.alias_len_high.insert(0, "6")
+
+        spec_card = ctk.CTkFrame(
+            root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
+        )
+        spec_card.pack(fill="x", pady=(0, 16))
+        spec_inner = ctk.CTkFrame(spec_card, fg_color="transparent")
+        spec_inner.pack(fill="x", padx=18, pady=16)
+        ctk.CTkLabel(
+            spec_inner,
+            text="3. 指定随机（可空；有内容则原样接在 + 后、随机前）",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=COLORS["text"],
+        ).pack(anchor="w")
+        self.alias_specified = ctk.CTkEntry(
+            spec_inner,
+            height=38,
+            corner_radius=10,
+            fg_color=COLORS["input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            placeholder_text="例如 vip，结果如 frank+vipab3x@…",
+        )
+        self.alias_specified.pack(fill="x", pady=(12, 0))
+
         out_card = ctk.CTkFrame(
             root, fg_color=COLORS["panel"], corner_radius=16, border_width=1, border_color=COLORS["border"]
         )
@@ -599,7 +672,7 @@ class FormatToolApp(ctk.CTk):
         out_inner.pack(fill="x", padx=18, pady=16)
         ctk.CTkLabel(
             out_inner,
-            text="2. 输出位置",
+            text="4. 输出位置",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
             text_color=COLORS["text"],
         ).pack(anchor="w")
@@ -1193,6 +1266,11 @@ class FormatToolApp(ctk.CTk):
         try:
             if self.alias_path is None:
                 raise ProcessError("请先选择 txt 文件。")
+            min_len, max_len = parse_alias_length(
+                self.alias_len_low.get(),
+                self.alias_len_high.get(),
+            )
+            specified = self.alias_specified.get()
         except ProcessError as exc:
             messagebox.showerror("无法开始", str(exc))
             self.set_alias_status(str(exc), COLORS["danger"])
@@ -1206,12 +1284,14 @@ class FormatToolApp(ctk.CTk):
 
         thread = threading.Thread(
             target=self._run_alias,
-            args=(self.alias_path,),
+            args=(self.alias_path, min_len, max_len, specified),
             daemon=True,
         )
         thread.start()
 
-    def _run_alias(self, source: Path) -> None:
+    def _run_alias(
+        self, source: Path, min_len: int, max_len: int, specified: str
+    ) -> None:
         try:
             def on_progress(done: int, total: int, success: int, skipped: int) -> None:
                 ratio = (done / total) if total else 1.0
@@ -1226,7 +1306,14 @@ class FormatToolApp(ctk.CTk):
                     ),
                 )
 
-            result = process_alias_file(source, get_output_dir(), on_progress)
+            result = process_alias_file(
+                source,
+                get_output_dir(),
+                on_progress,
+                min_len=min_len,
+                max_len=max_len,
+                specified=specified,
+            )
             self.after(0, lambda r=result: self._on_alias_success(r))
         except ProcessError as exc:
             self.after(0, lambda msg=str(exc): self._on_alias_error(msg))

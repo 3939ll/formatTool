@@ -259,25 +259,71 @@ def merge_files(
     )
 
 
-def randomize_email_local(email: str) -> str | None:
-    """在 @ 前插入 + 与 4~6 位随机小写字母；无 @ 返回 None。"""
+_ALIAS_RAND_CHARS = string.ascii_lowercase + string.digits
+_ALIAS_LEN_MAX = 128
+
+
+def parse_alias_length(low_raw: str, high_raw: str) -> tuple[int, int]:
+    """解析随机位数：都空=4~6；只填一边=固定该位数；左>右则对调；0 不允许。"""
+    left = low_raw.strip()
+    right = high_raw.strip()
+
+    def _one(text: str, label: str) -> int:
+        if not text.isdigit():
+            raise ProcessError(f"随机位数{label}必须是正整数。")
+        value = int(text)
+        if value < 1:
+            raise ProcessError("随机位数不能为 0。")
+        if value > _ALIAS_LEN_MAX:
+            raise ProcessError(f"随机位数不能超过 {_ALIAS_LEN_MAX}。")
+        return value
+
+    if not left and not right:
+        return 4, 6
+    if left and not right:
+        n = _one(left, "左侧")
+        return n, n
+    if right and not left:
+        n = _one(right, "右侧")
+        return n, n
+
+    lo = _one(left, "左侧")
+    hi = _one(right, "右侧")
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def randomize_email_local(
+    email: str,
+    min_len: int = 4,
+    max_len: int = 6,
+    specified: str = "",
+) -> str | None:
+    """在 @ 前插入 +、可选指定串、再接随机串（首字母必为小写，其余小写+数字）。"""
     if "@" not in email:
         return None
     local, domain = email.split("@", 1)
     if not local or not domain:
         return None
-    n = random.randint(4, 6)
-    suffix = "".join(random.choices(string.ascii_lowercase, k=n))
-    return f"{local}+{suffix}@{domain}"
+    n = random.randint(min_len, max_len)
+    first = random.choice(string.ascii_lowercase)
+    rest = "".join(random.choices(_ALIAS_RAND_CHARS, k=n - 1)) if n > 1 else ""
+    return f"{local}+{specified}{first}{rest}@{domain}"
 
 
 def process_alias_file(
     source: Path,
     output_dir: Path | None = None,
     progress_callback=None,
+    min_len: int = 4,
+    max_len: int = 6,
+    specified: str = "",
 ) -> ProcessResult:
     """对每行第 1 段邮箱做别名随机，其余段原样保留。"""
     _require_txt(source, "上传")
+    if min_len < 1 or max_len < 1 or min_len > max_len:
+        raise ProcessError("随机位数范围无效。")
     encoding = detect_encoding(source)
     out_dir = output_dir or get_output_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -304,7 +350,9 @@ def process_alias_file(
                 skipped_lines += 1
             else:
                 parts = text.split(SEPARATOR)
-                new_email = randomize_email_local(parts[0])
+                new_email = randomize_email_local(
+                    parts[0], min_len, max_len, specified
+                )
                 if new_email is None:
                     skipped_lines += 1
                 else:
